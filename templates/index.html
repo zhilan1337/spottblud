@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Spotted — zostaw karteczkę</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<main>
+  <header class="hero">
+    <h1>Widziałeś coś?<br>Powiedz <span>cicho</span>.</h1>
+    <p class="lede">Zero loginu, zero śladów. Moderujemy, akceptujemy, wrzucamy na Insta.</p>
+  </header>
+
+  <section class="note-card" id="card">
+    <form id="spotted-form">
+      <textarea
+        id="content"
+        maxlength="{{ max_len }}"
+        placeholder="Widziałam/em Cię dziś..."
+        required
+      ></textarea>
+      <div class="note-footer">
+        <span class="counter"><span id="count">0</span>/{{ max_len }}</span>
+        <button type="submit" id="submit-btn">
+          <span class="btn-label">Przypnij anonimowo</span>
+        </button>
+      </div>
+    </form>
+    <p class="status" id="status" aria-live="polite"></p>
+  </section>
+
+  <p class="footnote">Zgłoszenia trafiają do moderacji, zanim ktokolwiek je zobaczy.</p>
+</main>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
