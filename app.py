@@ -4,6 +4,7 @@ Spotted - anonimowe zgłoszenia moderowane na Discordzie.
 Jeden proces łączy:
 - Flask (serwuje stronę + endpoint /submit)
 - discord.py bota (wysyła zgłoszenia na kanał moderacyjny, nasłuchuje reakcji ✅/❌)
+- po zaakceptowaniu (✅): generuje grafikę i (jeśli skonfigurowane) publikuje na Instagramie
 
 Uruchomienie: python app.py
 Wymagane zmienne środowiskowe w pliku .env (patrz .env.example)
@@ -12,6 +13,7 @@ Wymagane zmienne środowiskowe w pliku .env (patrz .env.example)
 import os
 import sqlite3
 import asyncio
+import logging
 import threading
 from datetime import datetime
 
@@ -19,7 +21,13 @@ import discord
 from flask import Flask, request, jsonify, render_template
 from dotenv import load_dotenv
 
+from image_generator import generate_post_image
+from instagram_publisher import publish_image, get_permalink
+
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("spotted")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 MOD_CHANNEL_ID = int(os.getenv("MOD_CHANNEL_ID", "0"))
@@ -28,6 +36,20 @@ DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "spotted.
 
 APPROVE_EMOJI = "✅"
 REJECT_EMOJI = "❌"
+
+# --- Instagram ---
+IG_USER_ID = os.getenv("IG_USER_ID")
+IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
+IG_CAPTION_EXTRA = os.getenv("IG_CAPTION_EXTRA", "")
+IG_ENABLED = bool(IG_USER_ID and IG_ACCESS_TOKEN and PUBLIC_BASE_URL)
+
+if not IG_ENABLED:
+    log.warning(
+        "Publikacja na Instagramie WYŁĄCZONA - brak IG_USER_ID / IG_ACCESS_TOKEN / "
+        "PUBLIC_BASE_URL w zmiennych środowiskowych. Zaakceptowane zgłoszenia będą "
+        "tylko oznaczane, bez automatycznej publikacji."
+    )
 
 # ---------------------------------------------------------------------------
 # Baza danych
@@ -48,9 +70,17 @@ def init_db():
                 status TEXT NOT NULL DEFAULT 'pending',
                 discord_message_id TEXT,
                 created_at TEXT NOT NULL,
-                decided_at TEXT
+                decided_at TEXT,
+                instagram_media_id TEXT,
+                published_at TEXT,
+                publish_error TEXT
             )
         """)
+        # Dokładka dla baz założonych przed dodaniem kolumn IG
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(submissions)")}
+        for col in ("instagram_media_id", "published_at", "publish_error"):
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE submissions ADD COLUMN {col} TEXT")
 
 
 init_db()
@@ -106,13 +136,71 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
     channel = bot.get_channel(payload.channel_id)
     message = await channel.fetch_message(payload.message_id)
-
-    label = "✅ ZAAKCEPTOWANE — wklej ręcznie na Instagrama" if new_status == "approved" else "❌ ODRZUCONE"
     embed = message.embeds[0]
-    embed.color = discord.Color.green() if new_status == "approved" else discord.Color.red()
-    embed.set_footer(text=label)
+
+    if new_status == "rejected":
+        embed.color = discord.Color.red()
+        embed.set_footer(text="❌ ODRZUCONE")
+        await message.edit(embed=embed)
+        await message.clear_reactions()
+        return
+
+    # --- Zaakceptowane: generujemy grafikę i (jeśli skonfigurowane) publikujemy na IG ---
+    await message.clear_reactions()  # blokuje ponowne klikanie w trakcie przetwarzania
+
+    if not IG_ENABLED:
+        embed.color = discord.Color.green()
+        embed.set_footer(text="✅ ZAAKCEPTOWANE — Instagram nie skonfigurowany, wklej ręcznie")
+        await message.edit(embed=embed)
+        return
+
+    embed.color = discord.Color.gold()
+    embed.set_footer(text="⏳ Generuję grafikę i publikuję na Instagramie...")
     await message.edit(embed=embed)
-    await message.clear_reactions()
+
+    await publish_approved_submission(row["id"], row["content"], message, embed)
+
+
+async def publish_approved_submission(submission_id: int, content: str,
+                                       message: discord.Message, embed: discord.Embed):
+    try:
+        filename = await asyncio.to_thread(generate_post_image, submission_id, content)
+        image_url = f"{PUBLIC_BASE_URL}/static/generated/{filename}"
+
+        caption = content.strip()
+        if IG_CAPTION_EXTRA:
+            caption = f"{caption}\n\n{IG_CAPTION_EXTRA}"
+        caption = caption[:2200]  # limit Instagrama na długość podpisu
+
+        media_id = await asyncio.to_thread(
+            publish_image, IG_USER_ID, IG_ACCESS_TOKEN, image_url, caption
+        )
+        permalink = await asyncio.to_thread(get_permalink, media_id, IG_ACCESS_TOKEN)
+
+        with db() as conn:
+            conn.execute(
+                "UPDATE submissions SET instagram_media_id = ?, published_at = ? WHERE id = ?",
+                (media_id, datetime.utcnow().isoformat(), submission_id),
+            )
+
+        embed.color = discord.Color.green()
+        embed.set_image(url=image_url)
+        embed.set_footer(text="✅ ZAAKCEPTOWANE I OPUBLIKOWANE NA INSTAGRAMIE")
+        if permalink:
+            embed.add_field(name="Link do posta", value=permalink, inline=False)
+        await message.edit(embed=embed)
+
+    except Exception as exc:  # noqa: BLE001 - chcemy złapać wszystko i pokazać moderacji błąd
+        log.exception("Publikacja na Instagramie nie powiodła się (zgłoszenie #%s)", submission_id)
+        with db() as conn:
+            conn.execute(
+                "UPDATE submissions SET publish_error = ? WHERE id = ?",
+                (str(exc), submission_id),
+            )
+        embed.color = discord.Color.orange()
+        embed.set_footer(text="⚠️ Zaakceptowane, ale publikacja na IG nie powiodła się — wklej ręcznie")
+        embed.add_field(name="Błąd", value=str(exc)[:1000], inline=False)
+        await message.edit(embed=embed)
 
 
 async def send_to_discord(submission_id: int, content: str):
