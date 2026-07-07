@@ -17,7 +17,7 @@ import time
 import requests
 
 GRAPH_API_VERSION = "v22.0"
-GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+GRAPH_API_BASE = f"https://graph.instagram.com/{GRAPH_API_VERSION}"
 
 
 class InstagramPublishError(Exception):
