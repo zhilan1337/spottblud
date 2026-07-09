@@ -5,7 +5,8 @@ Jeden proces łączy:
 - Flask (serwuje stronę + endpoint /submit)
 - discord.py bota (wysyła zgłoszenia na kanał moderacyjny, nasłuchuje reakcji ✅/❌)
 - po zaakceptowaniu (✅): generuje grafikę i wrzuca ją do kolejki
-- co jakiś czas: publikuje zebrane zgłoszenia razem jako karuzelę na Instagramie
+- co jakiś czas (albo na żądanie przez /wstaw): publikuje zebrane zgłoszenia
+  razem jako karuzelę na Instagramie
 
 Uruchomienie: python app.py
 Wymagane zmienne środowiskowe w pliku .env (patrz .env.example)
@@ -19,6 +20,7 @@ import threading
 from datetime import datetime
 
 import discord
+from discord import app_commands
 from flask import Flask, request, jsonify, render_template
 from dotenv import load_dotenv
 
@@ -46,14 +48,9 @@ IG_CAPTION_EXTRA = os.getenv("IG_CAPTION_EXTRA", "")
 IG_ENABLED = bool(IG_USER_ID and IG_ACCESS_TOKEN and PUBLIC_BASE_URL)
 
 # --- Stackowanie w karuzele ---
-# Ile zgłoszeń minimum, żeby zrobić karuzelę (Instagram wymaga min 2 w karuzeli)
 CAROUSEL_MIN_ITEMS = int(os.getenv("CAROUSEL_MIN_ITEMS", "2"))
-# Maksimum zdjęć w jednej karuzeli (twardy limit Instagrama to 10)
 CAROUSEL_MAX_ITEMS = int(os.getenv("CAROUSEL_MAX_ITEMS", "10"))
-# Co ile minut sprawdzamy kolejkę i próbujemy publikować
 CAROUSEL_CHECK_INTERVAL_MINUTES = int(os.getenv("CAROUSEL_CHECK_INTERVAL_MINUTES", "15"))
-# Jeśli w kolejce jest mniej niż CAROUSEL_MIN_ITEMS, ale najstarsze czeka dłużej
-# niż tyle minut - publikujemy mimo wszystko (pojedynczo, jeśli zostało 1)
 CAROUSEL_MAX_WAIT_MINUTES = int(os.getenv("CAROUSEL_MAX_WAIT_MINUTES", "120"))
 
 if not IG_ENABLED:
@@ -107,17 +104,56 @@ intents.reactions = True
 intents.guilds = True
 
 bot = discord.Client(intents=intents)
+tree = app_commands.CommandTree(bot)
 bot_loop = None  # ustawiane po starcie bota, do wywoływania z wątku Flaska
 _carousel_task_started = False
+
+
+def _is_moderator(member: discord.Member | None) -> bool:
+    if not MOD_ROLE_ID:
+        return True
+    if member is None:
+        return False
+    return any(str(r.id) == MOD_ROLE_ID for r in member.roles)
 
 
 @bot.event
 async def on_ready():
     global _carousel_task_started
     print(f"[bot] Zalogowano jako {bot.user}")
+
+    for guild in bot.guilds:
+        try:
+            await tree.sync(guild=guild)
+        except Exception:
+            log.exception("Nie udało się zsynchronizować slash-komend dla guildu %s", guild.id)
+
     if IG_ENABLED and not _carousel_task_started:
         _carousel_task_started = True
         bot.loop.create_task(carousel_publisher_loop())
+
+
+@tree.command(name="wstaw", description="Publikuje zaległe zaakceptowane zgłoszenia na Instagramie (ręcznie, teraz).")
+async def wstaw_command(interaction: discord.Interaction):
+    if not _is_moderator(interaction.user if isinstance(interaction.user, discord.Member) else None):
+        await interaction.response.send_message("Nie masz uprawnień do tej komendy.", ephemeral=True)
+        return
+
+    if not IG_ENABLED:
+        await interaction.response.send_message("Publikacja na Instagramie jest wyłączona (brak konfiguracji).", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    result = await try_publish_queue(force=True)
+
+    if result["status"] == "empty":
+        await interaction.followup.send("Kolejka jest pusta - nic do opublikowania.", ephemeral=True)
+    elif result["status"] == "published":
+        extra = f" (karuzela, {result['count']} zdjęć)" if result["count"] > 1 else ""
+        link = f"\n{result['permalink']}" if result.get("permalink") else ""
+        await interaction.followup.send(f"Opublikowano{extra}.{link}", ephemeral=True)
+    else:
+        await interaction.followup.send(f"Publikacja nie powiodła się: {result.get('error', 'nieznany błąd')}", ephemeral=True)
 
 
 @bot.event
@@ -191,7 +227,7 @@ async def generate_and_queue(submission_id: int, content: str,
         image_url = f"{PUBLIC_BASE_URL}/static/generated/{filename}"
         embed.color = discord.Color.gold()
         embed.set_image(url=image_url)
-        embed.set_footer(text="✅ Zaakceptowane — czeka w kolejce na wspólny post")
+        embed.set_footer(text="✅ Zaakceptowane — czeka w kolejce na wspólny post (użyj /wstaw, by opublikować teraz)")
         await message.edit(embed=embed)
 
     except Exception as exc:  # noqa: BLE001
@@ -218,31 +254,35 @@ async def carousel_publisher_loop():
         await asyncio.sleep(CAROUSEL_CHECK_INTERVAL_MINUTES * 60)
 
 
-async def try_publish_queue():
+async def try_publish_queue(force: bool = False) -> dict:
+    """
+    Sprawdza kolejkę i publikuje, jeśli warunki spełnione (albo force=True - wtedy
+    publikuje natychmiast to, co jest w kolejce, niezależnie od progów).
+    Zwraca dict z wynikiem, używany też przez komendę /wstaw do odpowiedzi.
+    """
     with db() as conn:
         rows = conn.execute(
             "SELECT * FROM submissions WHERE status = 'queued_ig' ORDER BY decided_at ASC"
         ).fetchall()
 
     if not rows:
-        return
+        return {"status": "empty"}
 
-    oldest_wait_minutes = (
-        datetime.utcnow() - datetime.fromisoformat(rows[0]["decided_at"])
-    ).total_seconds() / 60
-
-    if len(rows) < CAROUSEL_MIN_ITEMS and oldest_wait_minutes < CAROUSEL_MAX_WAIT_MINUTES:
-        return  # jeszcze poczekamy na więcej zgłoszeń
+    if not force:
+        oldest_wait_minutes = (
+            datetime.utcnow() - datetime.fromisoformat(rows[0]["decided_at"])
+        ).total_seconds() / 60
+        if len(rows) < CAROUSEL_MIN_ITEMS and oldest_wait_minutes < CAROUSEL_MAX_WAIT_MINUTES:
+            return {"status": "waiting"}
 
     batch = rows[:CAROUSEL_MAX_ITEMS]
 
     if len(batch) == 1:
-        await publish_single_from_queue(batch[0])
-    else:
-        await publish_carousel_batch(batch)
+        return await publish_single_from_queue(batch[0])
+    return await publish_carousel_batch(batch)
 
 
-async def publish_carousel_batch(rows):
+async def publish_carousel_batch(rows) -> dict:
     image_urls = [f"{PUBLIC_BASE_URL}/static/generated/{r['image_filename']}" for r in rows]
     caption = "\n\n---\n\n".join(r["content"].strip() for r in rows)
     if IG_CAPTION_EXTRA:
@@ -265,6 +305,7 @@ async def publish_carousel_batch(rows):
                 )
 
         await update_discord_messages(rows, success=True, permalink=permalink, batch_size=len(rows))
+        return {"status": "published", "count": len(rows), "permalink": permalink}
 
     except Exception as exc:  # noqa: BLE001
         log.exception("Publikacja karuzeli nie powiodła się (zgłoszenia: %s)", [r["id"] for r in rows])
@@ -275,9 +316,10 @@ async def publish_carousel_batch(rows):
                     (str(exc), r["id"]),
                 )
         await update_discord_messages(rows, success=False, error=str(exc))
+        return {"status": "error", "error": str(exc)}
 
 
-async def publish_single_from_queue(row):
+async def publish_single_from_queue(row) -> dict:
     submission_id = row["id"]
     image_url = f"{PUBLIC_BASE_URL}/static/generated/{row['image_filename']}"
     caption = row["content"].strip()
@@ -300,6 +342,7 @@ async def publish_single_from_queue(row):
             )
 
         await update_discord_messages([row], success=True, permalink=permalink, batch_size=1)
+        return {"status": "published", "count": 1, "permalink": permalink}
 
     except Exception as exc:  # noqa: BLE001
         log.exception("Publikacja nie powiodła się (zgłoszenie #%s)", submission_id)
@@ -309,6 +352,7 @@ async def publish_single_from_queue(row):
                 (str(exc), submission_id),
             )
         await update_discord_messages([row], success=False, error=str(exc))
+        return {"status": "error", "error": str(exc)}
 
 
 async def update_discord_messages(rows, success, permalink=None, error=None, batch_size=None):
@@ -325,7 +369,7 @@ async def update_discord_messages(rows, success, permalink=None, error=None, bat
         embed = message.embeds[0]
         if success:
             embed.color = discord.Color.green()
-            label = f"✅ OPUBLIKOWANE" + (f" (karuzela, {batch_size} zdjęć)" if batch_size and batch_size > 1 else "")
+            label = "✅ OPUBLIKOWANE" + (f" (karuzela, {batch_size} zdjęć)" if batch_size and batch_size > 1 else "")
             embed.set_footer(text=label)
             if permalink:
                 embed.add_field(name="Link do posta", value=permalink, inline=False)
