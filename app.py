@@ -4,7 +4,8 @@ Spotted - anonimowe zgłoszenia moderowane na Discordzie.
 Jeden proces łączy:
 - Flask (serwuje stronę + endpoint /submit)
 - discord.py bota (wysyła zgłoszenia na kanał moderacyjny, nasłuchuje reakcji ✅/❌)
-- po zaakceptowaniu (✅): generuje grafikę i (jeśli skonfigurowane) publikuje na Instagramie
+- po zaakceptowaniu (✅): generuje grafikę i wrzuca ją do kolejki
+- co jakiś czas: publikuje zebrane zgłoszenia razem jako karuzelę na Instagramie
 
 Uruchomienie: python app.py
 Wymagane zmienne środowiskowe w pliku .env (patrz .env.example)
@@ -22,7 +23,7 @@ from flask import Flask, request, jsonify, render_template
 from dotenv import load_dotenv
 
 from image_generator import generate_post_image
-from instagram_publisher import publish_image, get_permalink
+from instagram_publisher import publish_image, publish_carousel, get_permalink
 
 load_dotenv()
 
@@ -43,6 +44,17 @@ IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 IG_CAPTION_EXTRA = os.getenv("IG_CAPTION_EXTRA", "")
 IG_ENABLED = bool(IG_USER_ID and IG_ACCESS_TOKEN and PUBLIC_BASE_URL)
+
+# --- Stackowanie w karuzele ---
+# Ile zgłoszeń minimum, żeby zrobić karuzelę (Instagram wymaga min 2 w karuzeli)
+CAROUSEL_MIN_ITEMS = int(os.getenv("CAROUSEL_MIN_ITEMS", "2"))
+# Maksimum zdjęć w jednej karuzeli (twardy limit Instagrama to 10)
+CAROUSEL_MAX_ITEMS = int(os.getenv("CAROUSEL_MAX_ITEMS", "10"))
+# Co ile minut sprawdzamy kolejkę i próbujemy publikować
+CAROUSEL_CHECK_INTERVAL_MINUTES = int(os.getenv("CAROUSEL_CHECK_INTERVAL_MINUTES", "15"))
+# Jeśli w kolejce jest mniej niż CAROUSEL_MIN_ITEMS, ale najstarsze czeka dłużej
+# niż tyle minut - publikujemy mimo wszystko (pojedynczo, jeśli zostało 1)
+CAROUSEL_MAX_WAIT_MINUTES = int(os.getenv("CAROUSEL_MAX_WAIT_MINUTES", "120"))
 
 if not IG_ENABLED:
     log.warning(
@@ -71,14 +83,14 @@ def init_db():
                 discord_message_id TEXT,
                 created_at TEXT NOT NULL,
                 decided_at TEXT,
+                image_filename TEXT,
                 instagram_media_id TEXT,
                 published_at TEXT,
                 publish_error TEXT
             )
         """)
-        # Dokładka dla baz założonych przed dodaniem kolumn IG
         existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(submissions)")}
-        for col in ("instagram_media_id", "published_at", "publish_error"):
+        for col in ("image_filename", "instagram_media_id", "published_at", "publish_error"):
             if col not in existing_cols:
                 conn.execute(f"ALTER TABLE submissions ADD COLUMN {col} TEXT")
 
@@ -96,11 +108,16 @@ intents.guilds = True
 
 bot = discord.Client(intents=intents)
 bot_loop = None  # ustawiane po starcie bota, do wywoływania z wątku Flaska
+_carousel_task_started = False
 
 
 @bot.event
 async def on_ready():
+    global _carousel_task_started
     print(f"[bot] Zalogowano jako {bot.user}")
+    if IG_ENABLED and not _carousel_task_started:
+        _carousel_task_started = True
+        bot.loop.create_task(carousel_publisher_loop())
 
 
 @bot.event
@@ -112,7 +129,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if payload.channel_id != MOD_CHANNEL_ID:
         return
 
-    # Sprawdź rolę moderatora, jeśli skonfigurowana
     if MOD_ROLE_ID:
         guild = bot.get_guild(payload.guild_id)
         member = guild.get_member(payload.user_id) if guild else None
@@ -145,8 +161,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         await message.clear_reactions()
         return
 
-    # --- Zaakceptowane: generujemy grafikę i (jeśli skonfigurowane) publikujemy na IG ---
-    await message.clear_reactions()  # blokuje ponowne klikanie w trakcie przetwarzania
+    await message.clear_reactions()
 
     if not IG_ENABLED:
         embed.color = discord.Color.green()
@@ -155,51 +170,169 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
 
     embed.color = discord.Color.gold()
-    embed.set_footer(text="⏳ Generuję grafikę i publikuję na Instagramie...")
+    embed.set_footer(text="⏳ Generuję grafikę...")
     await message.edit(embed=embed)
 
-    await publish_approved_submission(row["id"], row["content"], message, embed)
+    await generate_and_queue(row["id"], row["content"], message, embed)
 
 
-async def publish_approved_submission(submission_id: int, content: str,
-                                       message: discord.Message, embed: discord.Embed):
+async def generate_and_queue(submission_id: int, content: str,
+                              message: discord.Message, embed: discord.Embed):
+    """Generuje grafikę i wrzuca zgłoszenie do kolejki na wspólny post karuzelowy."""
     try:
         filename = await asyncio.to_thread(generate_post_image, submission_id, content)
-        image_url = f"{PUBLIC_BASE_URL}/static/generated/{filename}"
-
-        caption = content.strip()
-        if IG_CAPTION_EXTRA:
-            caption = f"{caption}\n\n{IG_CAPTION_EXTRA}"
-        caption = caption[:2200]  # limit Instagrama na długość podpisu
-
-        media_id = await asyncio.to_thread(
-            publish_image, IG_USER_ID, IG_ACCESS_TOKEN, image_url, caption
-        )
-        permalink = await asyncio.to_thread(get_permalink, media_id, IG_ACCESS_TOKEN)
 
         with db() as conn:
             conn.execute(
-                "UPDATE submissions SET instagram_media_id = ?, published_at = ? WHERE id = ?",
-                (media_id, datetime.utcnow().isoformat(), submission_id),
+                "UPDATE submissions SET status = 'queued_ig', image_filename = ? WHERE id = ?",
+                (filename, submission_id),
             )
 
-        embed.color = discord.Color.green()
+        image_url = f"{PUBLIC_BASE_URL}/static/generated/{filename}"
+        embed.color = discord.Color.gold()
         embed.set_image(url=image_url)
-        embed.set_footer(text="✅ ZAAKCEPTOWANE I OPUBLIKOWANE NA INSTAGRAMIE")
-        if permalink:
-            embed.add_field(name="Link do posta", value=permalink, inline=False)
+        embed.set_footer(text="✅ Zaakceptowane — czeka w kolejce na wspólny post")
         await message.edit(embed=embed)
 
-    except Exception as exc:  # noqa: BLE001 - chcemy złapać wszystko i pokazać moderacji błąd
-        log.exception("Publikacja na Instagramie nie powiodła się (zgłoszenie #%s)", submission_id)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Generowanie grafiki nie powiodło się (zgłoszenie #%s)", submission_id)
         with db() as conn:
             conn.execute(
                 "UPDATE submissions SET publish_error = ? WHERE id = ?",
                 (str(exc), submission_id),
             )
         embed.color = discord.Color.orange()
-        embed.set_footer(text="⚠️ Zaakceptowane, ale publikacja na IG nie powiodła się — wklej ręcznie")
+        embed.set_footer(text="⚠️ Zaakceptowane, ale generowanie grafiki nie powiodło się")
         embed.add_field(name="Błąd", value=str(exc)[:1000], inline=False)
+        await message.edit(embed=embed)
+
+
+async def carousel_publisher_loop():
+    """W tle, co CAROUSEL_CHECK_INTERVAL_MINUTES, próbuje opublikować kolejkę."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await try_publish_queue()
+        except Exception:
+            log.exception("Błąd w pętli publikującej karuzele")
+        await asyncio.sleep(CAROUSEL_CHECK_INTERVAL_MINUTES * 60)
+
+
+async def try_publish_queue():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM submissions WHERE status = 'queued_ig' ORDER BY decided_at ASC"
+        ).fetchall()
+
+    if not rows:
+        return
+
+    oldest_wait_minutes = (
+        datetime.utcnow() - datetime.fromisoformat(rows[0]["decided_at"])
+    ).total_seconds() / 60
+
+    if len(rows) < CAROUSEL_MIN_ITEMS and oldest_wait_minutes < CAROUSEL_MAX_WAIT_MINUTES:
+        return  # jeszcze poczekamy na więcej zgłoszeń
+
+    batch = rows[:CAROUSEL_MAX_ITEMS]
+
+    if len(batch) == 1:
+        await publish_single_from_queue(batch[0])
+    else:
+        await publish_carousel_batch(batch)
+
+
+async def publish_carousel_batch(rows):
+    image_urls = [f"{PUBLIC_BASE_URL}/static/generated/{r['image_filename']}" for r in rows]
+    caption = "\n\n---\n\n".join(r["content"].strip() for r in rows)
+    if IG_CAPTION_EXTRA:
+        caption = f"{caption}\n\n{IG_CAPTION_EXTRA}"
+    caption = caption[:2200]
+
+    try:
+        media_id = await asyncio.to_thread(
+            publish_carousel, IG_USER_ID, IG_ACCESS_TOKEN, image_urls, caption
+        )
+        permalink = await asyncio.to_thread(get_permalink, media_id, IG_ACCESS_TOKEN)
+
+        now = datetime.utcnow().isoformat()
+        with db() as conn:
+            for r in rows:
+                conn.execute(
+                    "UPDATE submissions SET status = 'published', instagram_media_id = ?, "
+                    "published_at = ? WHERE id = ?",
+                    (media_id, now, r["id"]),
+                )
+
+        await update_discord_messages(rows, success=True, permalink=permalink, batch_size=len(rows))
+
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Publikacja karuzeli nie powiodła się (zgłoszenia: %s)", [r["id"] for r in rows])
+        with db() as conn:
+            for r in rows:
+                conn.execute(
+                    "UPDATE submissions SET publish_error = ? WHERE id = ?",
+                    (str(exc), r["id"]),
+                )
+        await update_discord_messages(rows, success=False, error=str(exc))
+
+
+async def publish_single_from_queue(row):
+    submission_id = row["id"]
+    image_url = f"{PUBLIC_BASE_URL}/static/generated/{row['image_filename']}"
+    caption = row["content"].strip()
+    if IG_CAPTION_EXTRA:
+        caption = f"{caption}\n\n{IG_CAPTION_EXTRA}"
+    caption = caption[:2200]
+
+    try:
+        media_id = await asyncio.to_thread(
+            publish_image, IG_USER_ID, IG_ACCESS_TOKEN, image_url, caption
+        )
+        permalink = await asyncio.to_thread(get_permalink, media_id, IG_ACCESS_TOKEN)
+
+        now = datetime.utcnow().isoformat()
+        with db() as conn:
+            conn.execute(
+                "UPDATE submissions SET status = 'published', instagram_media_id = ?, "
+                "published_at = ? WHERE id = ?",
+                (media_id, now, submission_id),
+            )
+
+        await update_discord_messages([row], success=True, permalink=permalink, batch_size=1)
+
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Publikacja nie powiodła się (zgłoszenie #%s)", submission_id)
+        with db() as conn:
+            conn.execute(
+                "UPDATE submissions SET publish_error = ? WHERE id = ?",
+                (str(exc), submission_id),
+            )
+        await update_discord_messages([row], success=False, error=str(exc))
+
+
+async def update_discord_messages(rows, success, permalink=None, error=None, batch_size=None):
+    channel = bot.get_channel(MOD_CHANNEL_ID)
+    if channel is None:
+        return
+    for r in rows:
+        if not r["discord_message_id"]:
+            continue
+        try:
+            message = await channel.fetch_message(int(r["discord_message_id"]))
+        except discord.NotFound:
+            continue
+        embed = message.embeds[0]
+        if success:
+            embed.color = discord.Color.green()
+            label = f"✅ OPUBLIKOWANE" + (f" (karuzela, {batch_size} zdjęć)" if batch_size and batch_size > 1 else "")
+            embed.set_footer(text=label)
+            if permalink:
+                embed.add_field(name="Link do posta", value=permalink, inline=False)
+        else:
+            embed.color = discord.Color.orange()
+            embed.set_footer(text="⚠️ Publikacja nie powiodła się — sprawdź logi / wklej ręcznie")
+            embed.add_field(name="Błąd", value=(error or "")[:1000], inline=False)
         await message.edit(embed=embed)
 
 
