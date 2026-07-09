@@ -26,14 +26,14 @@ CARD_PADDING_TOP = 90
 CARD_PADDING_BOTTOM = 70
 
 # Kolory
-COLOR_GRADIENT_TOP = (33, 41, 90)      # ciemny granat
-COLOR_GRADIENT_BOTTOM = (86, 60, 122)  # fiolet
+COLOR_GRADIENT_TOP = (16, 14, 15)      # niemal czarny
+COLOR_GRADIENT_BOTTOM = (150, 22, 28)  # głęboka czerwień
 COLOR_CARD = (255, 255, 255)
-COLOR_TEXT = (30, 32, 46)
-COLOR_MUTED = (140, 140, 155)
+COLOR_TEXT = (24, 20, 21)
+COLOR_MUTED = (150, 135, 136)
 COLOR_ACCENT = (255, 255, 255)
-COLOR_ACCENT_BG = (33, 41, 90)
-COLOR_QUOTE_MARK = (230, 230, 238)
+COLOR_ACCENT_BG = (150, 22, 28)
+COLOR_QUOTE_MARK = (238, 224, 225)
 
 SITE_LABEL = os.getenv("IG_TEMPLATE_TITLE", "spotted żyrardów")
 FOOTER_LABEL = os.getenv("IG_TEMPLATE_FOOTER", "napisz swoją historię — link w bio")
