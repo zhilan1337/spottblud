@@ -1,208 +1,89 @@
 """
-Generator grafik pod posty na Instagrama.
+Publikacja zdjęcia na Instagramie przez Instagram Graph API (Content Publishing API).
 
-Bierze zaakceptowaną treść zgłoszenia i renderuje z niej kwadratowy obrazek
-(1080x1080, format wymagany przez Instagram Graph API) na bazie prostego,
-"kartkowego" szablonu: gradientowe tło + biała karta + tekst.
+Flow (dla pojedynczego zdjęcia):
+1. POST /{ig-user-id}/media  z image_url + caption  -> zwraca creation_id (kontener)
+2. (opcjonalnie) GET /{creation_id}?fields=status_code  -> czekamy aż status = FINISHED
+3. POST /{ig-user-id}/media_publish  z creation_id  -> publikuje na Instagramie
 
-Wynik zapisywany jest jako JPEG w static/generated/, żeby Flask mógł go
-serwować pod publicznym URL-em (wymaganym przez Instagram do pobrania obrazka).
+Wymaga:
+- IG_USER_ID   - numeryczne ID konta Instagram Business/Creator (NIE nazwa użytkownika)
+- IG_ACCESS_TOKEN - długożyjący token strony (Page Access Token) z uprawnieniami
+                     instagram_basic, instagram_content_publish, pages_show_list
+- Obrazek musi być dostępny pod publicznym adresem URL (Instagram sam go pobiera).
 """
+import time
+import requests
 
-import os
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
-
-BASE_DIR = os.path.dirname(__file__)
-FONT_DIR = os.path.join(BASE_DIR, "static", "fonts")
-OUTPUT_DIR = os.path.join(BASE_DIR, "static", "generated")
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-SIZE = 1080
-CARD_MARGIN = 90
-CARD_RADIUS = 46
-CARD_PADDING_X = 80
-CARD_PADDING_TOP = 90
-CARD_PADDING_BOTTOM = 70
-
-# Kolory
-COLOR_GRADIENT_TOP = (16, 14, 15)      # niemal czarny
-COLOR_GRADIENT_BOTTOM = (150, 22, 28)  # głęboka czerwień
-COLOR_CARD = (255, 255, 255)
-COLOR_TEXT = (24, 20, 21)
-COLOR_MUTED = (150, 135, 136)
-COLOR_ACCENT = (255, 255, 255)
-COLOR_ACCENT_BG = (150, 22, 28)
-COLOR_QUOTE_MARK = (238, 224, 225)
-
-SITE_LABEL = os.getenv("IG_TEMPLATE_TITLE", "spotted żyrardów")
-FOOTER_LABEL = os.getenv("IG_TEMPLATE_FOOTER", "napisz swoją historię — link w bio")
+GRAPH_API_VERSION = "v22.0"
+GRAPH_API_BASE = f"https://graph.instagram.com/{GRAPH_API_VERSION}"
 
 
-def _font(name: str, size: int) -> ImageFont.FreeTypeFont:
-    return ImageFont.truetype(os.path.join(FONT_DIR, f"{name}.ttf"), size)
+class InstagramPublishError(Exception):
+    pass
 
 
-def _vertical_gradient(size, top_color, bottom_color) -> Image.Image:
-    """Tworzy kwadratowy obrazek size x size z pionowym gradientem liniowym."""
-    column = Image.new("RGB", (1, size), color=0)
-    draw = ImageDraw.Draw(column)
-    for y in range(size):
-        t = y / (size - 1)
-        r = round(top_color[0] + (bottom_color[0] - top_color[0]) * t)
-        g = round(top_color[1] + (bottom_color[1] - top_color[1]) * t)
-        b = round(top_color[2] + (bottom_color[2] - top_color[2]) * t)
-        draw.point((0, y), fill=(r, g, b))
-    return column.resize((size, size))
+def _check_response(resp: requests.Response):
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json().get("error", {}).get("message", resp.text)
+        except ValueError:
+            detail = resp.text
+        raise InstagramPublishError(f"Instagram API error ({resp.status_code}): {detail}")
+    return resp.json()
 
 
-def _rounded_rect_shadow(img: Image.Image, box, radius, blur=28, offset=(0, 18), opacity=90):
-    shadow = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    sd = ImageDraw.Draw(shadow)
-    x0, y0, x1, y1 = box
-    sd.rounded_rectangle(
-        (x0 + offset[0], y0 + offset[1], x1 + offset[0], y1 + offset[1]),
-        radius=radius,
-        fill=(0, 0, 0, opacity),
-    )
-    shadow = shadow.filter(ImageFilter.GaussianBlur(blur))
-    img.alpha_composite(shadow)
-
-
-def _break_long_word(draw, word, font, max_width):
-    """Twardo łamie pojedyncze 'słowo' bez spacji (np. link, spam), gdy samo nie mieści się w linii."""
-    if draw.textlength(word, font=font) <= max_width:
-        return [word]
-    chunks = []
-    current = ""
-    for ch in word:
-        candidate = current + ch
-        if draw.textlength(candidate, font=font) <= max_width or not current:
-            current = candidate
-        else:
-            chunks.append(current)
-            current = ch
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont, max_width: int):
-    lines = []
-    for paragraph in text.split("\n"):
-        words = paragraph.split(" ")
-        if not words:
-            lines.append("")
-            continue
-        current = ""
-        for word in words:
-            for piece in _break_long_word(draw, word, font, max_width):
-                candidate = f"{current} {piece}".strip() if current else piece
-                if draw.textlength(candidate, font=font) <= max_width:
-                    current = candidate
-                else:
-                    if current:
-                        lines.append(current)
-                    current = piece
-        lines.append(current)
-    return lines
-
-
-def _fit_text(draw, text, max_width, max_height, font_name="Poppins-Medium",
-              start_size=58, min_size=28, line_spacing=1.4):
-    for size in range(start_size, min_size - 1, -2):
-        font = _font(font_name, size)
-        lines = _wrap_text(draw, text, font, max_width)
-        line_height = font.getbbox("Ślężąy")[3] * line_spacing
-        block_height = line_height * len(lines)
-        if block_height <= max_height:
-            return font, lines, line_height
-    # ostateczność - najmniejszy rozmiar, nawet jeśli się nie mieści (przytniemy wizualnie)
-    font = _font(font_name, min_size)
-    lines = _wrap_text(draw, text, font, max_width)
-    line_height = font.getbbox("Ślężąy")[3] * line_spacing
-    return font, lines, line_height
-
-
-def generate_post_image(submission_id: int, content: str) -> str:
+def publish_image(ig_user_id: str, access_token: str, image_url: str, caption: str,
+                   poll_attempts: int = 10, poll_delay_seconds: float = 2.0) -> str:
     """
-    Renderuje grafikę pod zgłoszenie i zapisuje jako JPEG.
-    Zwraca nazwę pliku (nie pełną ścieżkę) w static/generated/.
+    Publikuje pojedyncze zdjęcie na Instagramie. Zwraca ID opublikowanego media.
+    Podnosi InstagramPublishError w razie problemu (np. zły token, obrazek niedostępny).
     """
-    bg = _vertical_gradient(SIZE, COLOR_GRADIENT_TOP, COLOR_GRADIENT_BOTTOM).convert("RGBA")
-    canvas = Image.new("RGBA", (SIZE, SIZE))
-    canvas.alpha_composite(bg)
-
-    card_box = (CARD_MARGIN, CARD_MARGIN, SIZE - CARD_MARGIN, SIZE - CARD_MARGIN)
-    _rounded_rect_shadow(canvas, card_box, CARD_RADIUS)
-
-    draw = ImageDraw.Draw(canvas)
-    draw.rounded_rectangle(card_box, radius=CARD_RADIUS, fill=COLOR_CARD)
-
-    content_left = CARD_MARGIN + CARD_PADDING_X
-    content_right = SIZE - CARD_MARGIN - CARD_PADDING_X
-    content_width = content_right - content_left
-
-    # --- nagłówek: kropka + nazwa strony, po prawej numer zgłoszenia ---
-    header_y = CARD_MARGIN + CARD_PADDING_TOP
-    dot_r = 10
-    draw.ellipse(
-        (content_left, header_y, content_left + dot_r * 2, header_y + dot_r * 2),
-        fill=COLOR_ACCENT_BG,
+    create_resp = requests.post(
+        f"{GRAPH_API_BASE}/{ig_user_id}/media",
+        data={
+            "image_url": image_url,
+            "caption": caption,
+            "access_token": access_token,
+        },
+        timeout=30,
     )
-    label_font = _font("Poppins-SemiBold", 30)
-    draw.text(
-        (content_left + dot_r * 2 + 16, header_y - 8),
-        SITE_LABEL,
-        font=label_font,
-        fill=COLOR_TEXT,
+    creation_id = _check_response(create_resp)["id"]
+
+    for _ in range(poll_attempts):
+        status_resp = requests.get(
+            f"{GRAPH_API_BASE}/{creation_id}",
+            params={"fields": "status_code", "access_token": access_token},
+            timeout=30,
+        )
+        status = _check_response(status_resp).get("status_code")
+        if status == "FINISHED":
+            break
+        if status == "ERROR":
+            raise InstagramPublishError("Instagram nie zdołał przetworzyć obrazka (status ERROR).")
+        time.sleep(poll_delay_seconds)
+    else:
+        raise InstagramPublishError("Przekroczono czas oczekiwania na przetworzenie obrazka przez Instagram.")
+
+    publish_resp = requests.post(
+        f"{GRAPH_API_BASE}/{ig_user_id}/media_publish",
+        data={
+            "creation_id": creation_id,
+            "access_token": access_token,
+        },
+        timeout=30,
     )
+    return _check_response(publish_resp)["id"]
 
-    tag_font = _font("Poppins-SemiBold", 24)
-    tag_text = f"#{submission_id}"
-    tag_w = draw.textlength(tag_text, font=tag_font)
-    tag_pad_x, tag_pad_y = 22, 10
-    tag_box = (
-        content_right - tag_w - tag_pad_x * 2,
-        header_y - tag_pad_y,
-        content_right,
-        header_y + 34 + tag_pad_y,
-    )
-    draw.rounded_rectangle(tag_box, radius=22, fill=(240, 240, 245))
-    draw.text(
-        (tag_box[0] + tag_pad_x, tag_box[1] + tag_pad_y - 2),
-        tag_text,
-        font=tag_font,
-        fill=COLOR_MUTED,
-    )
 
-    # --- duży cudzysłów dekoracyjny ---
-    quote_font = _font("Poppins-ExtraBold", 130)
-    quote_y = header_y + 70
-    draw.text((content_left - 8, quote_y), "\u201d", font=quote_font, fill=COLOR_QUOTE_MARK)
-
-    # --- treść zgłoszenia, wyśrodkowana w pionie w pozostałej przestrzeni karty ---
-    text_top = quote_y + 130
-    text_bottom = SIZE - CARD_MARGIN - CARD_PADDING_BOTTOM - 60
-    available_height = text_bottom - text_top
-
-    font, lines, line_height = _fit_text(draw, content.strip(), content_width, available_height)
-
-    block_height = line_height * len(lines)
-    start_y = text_top + max(0, (available_height - block_height) / 2)
-
-    y = start_y
-    for line in lines:
-        draw.text((content_left, y), line, font=font, fill=COLOR_TEXT)
-        y += line_height
-
-    # --- stopka ---
-    footer_y = SIZE - CARD_MARGIN - CARD_PADDING_BOTTOM + 10
-    draw.line((content_left, footer_y, content_right, footer_y), fill=(230, 230, 236), width=2)
-    footer_font = _font("Poppins-Medium", 24)
-    draw.text((content_left, footer_y + 20), FOOTER_LABEL, font=footer_font, fill=COLOR_MUTED)
-
-    filename = f"post_{submission_id}.jpg"
-    out_path = os.path.join(OUTPUT_DIR, filename)
-    canvas.convert("RGB").save(out_path, "JPEG", quality=92)
-    return filename
+def get_permalink(media_id: str, access_token: str) -> str | None:
+    """Zwraca link do opublikowanego posta na Instagramie (może się nie udać - wtedy None)."""
+    try:
+        resp = requests.get(
+            f"{GRAPH_API_BASE}/{media_id}",
+            params={"fields": "permalink", "access_token": access_token},
+            timeout=15,
+        )
+        return _check_response(resp).get("permalink")
+    except (InstagramPublishError, requests.RequestException):
+        return None
