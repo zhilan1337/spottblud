@@ -50,6 +50,10 @@ IG_USER_ID = os.getenv("IG_USER_ID")
 IG_ACCESS_TOKEN = os.getenv("IG_ACCESS_TOKEN")
 PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 IG_CAPTION_EXTRA = os.getenv("IG_CAPTION_EXTRA", "")
+IG_HASHTAGS = os.getenv(
+    "IG_HASHTAGS",
+    "#zyrardow #żyrardów #spotted #spottedzyrardow #polska"
+).strip()
 IG_ENABLED = bool(IG_USER_ID and IG_ACCESS_TOKEN and PUBLIC_BASE_URL)
 
 if not IG_ENABLED:
@@ -233,6 +237,29 @@ async def send_to_discord(submission_id: int, content: str):
 # Slash-komendy: /status i /wstaw
 # ---------------------------------------------------------------------------
 
+def _build_caption(base_caption: str = None) -> str:
+    """
+    Składa finalny podpis pod post: opcjonalny tekst od moderatora (albo IG_CAPTION_EXTRA
+    jako domyślny), a na końcu stały zestaw hashtagów (IG_HASHTAGS). Całość przycięta
+    do limitu 2200 znaków Instagrama — jeśli trzeba coś obciąć, obcinane są hashtagi
+    jako ostatnie, żeby nie ucinać treści posta.
+    """
+    text = (base_caption or IG_CAPTION_EXTRA or "").strip()
+    if not IG_HASHTAGS:
+        return text[:2200]
+
+    combined = f"{text}\n\n{IG_HASHTAGS}" if text else IG_HASHTAGS
+    if len(combined) <= 2200:
+        return combined
+
+    # Nie mieści się razem z hashtagami — obetnij same hashtagi, zachowując treść posta
+    room_for_tags = 2200 - len(text) - 2  # -2 na "\n\n"
+    if room_for_tags <= 0:
+        return text[:2200]
+    trimmed_tags = IG_HASHTAGS[:room_for_tags].rsplit(" ", 1)[0]
+    return f"{text}\n\n{trimmed_tags}" if trimmed_tags else text[:2200]
+
+
 def _queued_rows():
     with db() as conn:
         return conn.execute(
@@ -306,7 +333,7 @@ async def wstaw_command(interaction: discord.Interaction, caption: str = None):
 
     batch = rows[:CAROUSEL_MAX_ITEMS]
     leftover = rows[CAROUSEL_MAX_ITEMS:]
-    final_caption = (caption or IG_CAPTION_EXTRA or "").strip()[:2200]
+    final_caption = _build_caption(caption)
     image_urls = [f"{PUBLIC_BASE_URL}/static/generated/post_{r['id']}.jpg" for r in batch]
 
     await interaction.response.defer(thinking=True)
